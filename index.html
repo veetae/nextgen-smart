@@ -1,0 +1,316 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8"/>
+  <title>NextGen SMART (No-Install)</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <style>
+    body{font-family:system-ui,Segoe UI,Arial,sans-serif;margin:24px;max-width:900px}
+    fieldset{border:1px solid #ccc;border-radius:8px;padding:12px;margin-bottom:16px}
+    input,button,select,textarea{padding:8px;margin:4px 0;width:100%;box-sizing:border-box}
+    code{background:#f5f5f5;padding:2px 4px;border-radius:4px}
+    .row{display:grid;grid-template-columns:1fr 1fr;gap:12px}
+    .hidden{display:none}
+    .ok{color:#0a7}
+    .err{color:#b00;white-space:pre-wrap}
+    .mono{font-family:ui-monospace,Consolas,monospace}
+    .btn{cursor:pointer}
+  </style>
+</head>
+<body>
+  <h1>NextGen SMART (Browser-only)</h1>
+  <p>Runs entirely in your browser. No installs. Uses OAuth2 + PKCE. Register the URL of this page as your Redirect URI in your NextGen app.</p>
+
+  <fieldset>
+    <legend>Config (from your NextGen app)</legend>
+    <label>Client ID <input id="clientId" placeholder="e.g., 0oaxxxxxxxx"/></label>
+    <label>Auth Base (issuer/oauth2) <input id="authBase" placeholder="https://YOUR-AUTH/oauth2"/></label>
+    <label>FHIR Base (R4) <input id="fhirBase" placeholder="https://YOUR-FHIR/fhir/R4"/></label>
+    <div class="row">
+      <div>
+        <label>Scopes
+          <input id="scopes" value="launch/patient patient/*.read openid profile offline_access system/*.write"/>
+        </label>
+      </div>
+      <div>
+        <label>Redirect URI (must match registration)
+          <input id="redirectUri" />
+        </label>
+      </div>
+    </div>
+    <button id="btnStart" class="btn">Authorize</button>
+    <div id="authStatus" class="mono"></div>
+  </fieldset>
+
+  <fieldset id="patientTools" class="hidden">
+    <legend>Patient Tools</legend>
+    <div class="row">
+      <button id="btnMedList" class="btn">Active Medications</button>
+      <button id="btnSummary" class="btn">Chart Summary (Problems/Allergies/Labs)</button>
+    </div>
+    <div class="row">
+      <div>
+        <label>Refill Task: Medication text
+          <input id="rfMed" placeholder="e.g., lisinopril 10 mg tablet"/>
+        </label>
+      </div>
+      <div>
+        <label>Reason
+          <input id="rfReason" placeholder="e.g., patient portal request"/>
+        </label>
+      </div>
+    </div>
+    <div class="row">
+      <div>
+        <label>Task Owner/Queue (optional)
+          <input id="rfOwner" placeholder="e.g., Refill Pool"/>
+        </label>
+      </div>
+      <div>
+        <button id="btnRefill" class="btn">Create Refill Task</button>
+      </div>
+    </div>
+  </fieldset>
+
+  <fieldset id="adminTools" class="hidden">
+    <legend>Admin / ID Lookup</legend>
+    <div class="row">
+      <div>
+        <label>Find Patient by MRN (identifier)
+          <input id="mrn" placeholder="MRN value (requires server scopes)"/>
+        </label>
+        <button id="btnFindMrn" class="btn">Resolve FHIR Patient ID</button>
+      </div>
+      <div>
+        <label>FHIR Patient ID
+          <input id="patientId" placeholder="Auto-populated for Patient-scoped tokens"/>
+        </label>
+      </div>
+    </div>
+  </fieldset>
+
+  <fieldset>
+    <legend>Output</legend>
+    <pre id="out" class="mono"></pre>
+    <div id="err" class="err"></div>
+  </fieldset>
+
+<script>
+/* ===== Utilities ===== */
+const qs = sel => document.querySelector(sel);
+const out = msg => qs('#out').textContent = (typeof msg === 'string') ? msg : JSON.stringify(msg, null, 2);
+const err = msg => qs('#err').textContent = (typeof msg === 'string') ? msg : JSON.stringify(msg, null, 2);
+const b64url = a => btoa(String.fromCharCode.apply(null, new Uint8Array(a))).replace(/\+/g,'-').replace(/\//g,'_').replace(/=+$/,'');
+const rnd = len => crypto.getRandomValues(new Uint8Array(len));
+async function sha256(s){ const enc = new TextEncoder().encode(s); const d = await crypto.subtle.digest('SHA-256', enc); return b64url(d); }
+function save(k,v){ localStorage.setItem(k, JSON.stringify(v)); }
+function load(k,def=null){ try{ return JSON.parse(localStorage.getItem(k)) ?? def }catch{ return def } }
+
+/* ===== Global state ===== */
+let accessToken = null;
+let idToken = null;
+let tokenType = null;
+let patientContext = null; // Patient/{id}, if present
+let fhirBase = null;
+let authBase = null;
+let refreshToken = null;
+
+/* ===== OAuth2 + PKCE (SMART) ===== */
+async function authorize(){
+  try{
+    const clientId   = qs('#clientId').value.trim();
+    authBase         = qs('#authBase').value.trim().replace(/\/$/,'');
+    fhirBase         = qs('#fhirBase').value.trim().replace(/\/$/,'');
+    const scopes     = qs('#scopes').value.trim();
+    const redirectUri= qs('#redirectUri').value.trim() || window.location.href.split('#')[0].split('?')[0];
+
+    if(!clientId||!authBase||!fhirBase) return err('Missing Client ID / Auth Base / FHIR Base');
+
+    const verifier = b64url(rnd(32));
+    const challenge = await sha256(verifier);
+    const state = b64url(rnd(16));
+    const nonce = b64url(rnd(16));
+
+    save('pkce', {verifier, state, nonce, clientId, redirectUri, authBase, fhirBase, scopes});
+
+    const authUrl = `${authBase}/authorize?` + new URLSearchParams({
+      response_type: 'code',
+      client_id: clientId,
+      redirect_uri: redirectUri,
+      scope: scopes,
+      state,
+      code_challenge: challenge,
+      code_challenge_method: 'S256',
+      aud: fhirBase,
+      nonce
+    }).toString();
+
+    window.location = authUrl;
+  }catch(e){ err(e.toString()); }
+}
+
+async function maybeHandleRedirect(){
+  const params = new URLSearchParams(window.location.search);
+  if(!params.get('code')) return;
+  const code = params.get('code');
+  const state = params.get('state');
+
+  const pkce = load('pkce');
+  if(!pkce || pkce.state !== state) { err('State mismatch.'); return; }
+
+  // Clean URL
+  window.history.replaceState({}, document.title, pkce.redirectUri);
+
+  try{
+    const tokRes = await fetch(`${pkce.authBase}/token`, {
+      method:'POST',
+      headers:{'Content-Type':'application/x-www-form-urlencoded'},
+      body: new URLSearchParams({
+        grant_type:'authorization_code',
+        code,
+        redirect_uri: pkce.redirectUri,
+        client_id: pkce.clientId,
+        code_verifier: pkce.verifier
+      })
+    });
+    if(!tokRes.ok){ err(await tokRes.text()); return; }
+    const tok = await tokRes.json();
+    accessToken = tok.access_token;
+    tokenType   = tok.token_type || 'Bearer';
+    idToken     = tok.id_token || null;
+    refreshToken= tok.refresh_token || null;
+    authBase    = pkce.authBase;
+    fhirBase    = pkce.fhirBase;
+
+    qs('#authStatus').textContent = 'Authorized. Token received.';
+    qs('#patientTools').classList.remove('hidden');
+    qs('#adminTools').classList.remove('hidden');
+
+    // Try to resolve Patient context
+    const me = await fhirGET('Patient');
+    const p = firstResource(me,'Patient');
+    if(p){ qs('#patientId').value = p.id; patientContext = p.id; }
+    out({token_received:true, patientContext});
+  }catch(e){ err(e.toString()); }
+}
+
+function authHeaders(){
+  return { 'Authorization': `Bearer ${accessToken}`, 'Accept': 'application/fhir+json', 'Content-Type':'application/fhir+json' };
+}
+
+async function fhirGET(path, params={}){
+  const url = new URL(`${fhirBase}/${path.replace(/^\//,'')}`);
+  Object.entries(params).forEach(([k,v])=> url.searchParams.set(k, v));
+  const r = await fetch(url.toString(), { headers: authHeaders() });
+  if(!r.ok) throw new Error(await r.text());
+  return r.json();
+}
+
+async function fhirPOST(path, body){
+  const r = await fetch(`${fhirBase}/${path.replace(/^\//,'')}`, {
+    method:'POST',
+    headers: authHeaders(),
+    body: JSON.stringify(body)
+  });
+  if(!r.ok) throw new Error(await r.text());
+  return r.json();
+}
+
+function firstResource(bundle, type){
+  if(!bundle || !bundle.entry) return null;
+  for(const e of bundle.entry){
+    if(e.resource && e.resource.resourceType===type) return e.resource;
+  }
+  return null;
+}
+
+/* ===== Workflows ===== */
+async function activeMeds(){
+  const pid = qs('#patientId').value || patientContext;
+  if(!pid) return err('No Patient ID in context.');
+  const bundle = await fhirGET('MedicationRequest', {patient: pid, status:'active'});
+  const meds = (bundle.entry||[]).map(e=>{
+    const mr = e.resource||{};
+    const med = (mr.medicationCodeableConcept && mr.medicationCodeableConcept.text) ||
+                (mr.medicationReference && mr.medicationReference.display) || '';
+    const dosage = (mr.dosageInstruction && mr.dosageInstruction[0] && (mr.dosageInstruction[0].text || '')) || '';
+    return {id: mr.id, status: mr.status, intent: mr.intent, authoredOn: mr.authoredOn, medication: med, dosage};
+  });
+  out(meds);
+}
+
+async function summary(){
+  const pid = qs('#patientId').value || patientContext;
+  if(!pid) return err('No Patient ID in context.');
+  const [problemsB, allergiesB, labsB] = await Promise.all([
+    fhirGET('Condition', {patient: pid, category:'problem-list-item'}),
+    fhirGET('AllergyIntolerance', {patient: pid}),
+    fhirGET('Observation', {patient: pid, category:'laboratory', _count: 50})
+  ]);
+  const problems = (problemsB.entry||[]).map(e=>({id:e.resource.id, code:textOrCode(e.resource.code), clinicalStatus:textOrCoding(e.resource.clinicalStatus), onset:e.resource.onsetDateTime}));
+  const allergies = (allergiesB.entry||[]).map(e=>({substance:textOrCode(e.resource.code), criticality:e.resource.criticality, clinicalStatus:textOrCoding(e.resource.clinicalStatus), verificationStatus:textOrCoding(e.resource.verificationStatus)}));
+  let labs = (labsB.entry||[]).map(e=>{
+    const ob = e.resource;
+    let val = '';
+    if(ob.valueQuantity) val = `${ob.valueQuantity.value} ${ob.valueQuantity.unit||''}`.trim();
+    else if(ob.valueString) val = ob.valueString;
+    return {code:textOrCode(ob.code), effective:ob.effectiveDateTime||ob.issued||'', value:val};
+  });
+  labs.sort((a,b)=> (b.effective||'').localeCompare(a.effective||''));
+  labs = labs.slice(0,25);
+  out({patientId: pid, problems, allergies, recentLabs: labs});
+}
+function textOrCode(x){ if(!x) return ''; return x.text || ((x.coding && x.coding[0] && (x.coding[0].display||x.coding[0].code))||''); }
+function textOrCoding(x){ if(!x) return ''; return x.text || ((x.coding && x.coding[0] && x.coding[0].code)||''); }
+
+async function refillTask(){
+  const pid = qs('#patientId').value || patientContext;
+  if(!pid) return err('No Patient ID in context.');
+  const med = qs('#rfMed').value.trim();
+  const reason = qs('#rfReason').value.trim();
+  const owner = qs('#rfOwner').value.trim();
+  if(!med || !reason) return err('Medication and Reason are required.');
+  const task = {
+    resourceType: "Task",
+    status: "requested",
+    intent: "order",
+    code: { text: "Medication Refill" },
+    for: { reference: `Patient/${pid}` },
+    authoredOn: new Date().toISOString(),
+    description: `Refill request: ${med}. Reason: ${reason}`
+  };
+  if(owner) task.owner = { display: owner };
+  const created = await fhirPOST('Task', task);
+  out(created);
+}
+
+/* ===== ID lookup via MRN (requires server scopes) ===== */
+async function findByMrn(){
+  const mrn = qs('#mrn').value.trim();
+  if(!mrn) return err('Enter MRN');
+  const bundle = await fhirGET('Patient', { identifier: mrn });
+  const p = firstResource(bundle,'Patient');
+  if(!p) return err('No patient found for MRN');
+  qs('#patientId').value = p.id;
+  out({patientId:p.id, mrn});
+}
+
+/* ===== Wire up ===== */
+document.addEventListener('DOMContentLoaded', ()=>{
+  qs('#redirectUri').value = window.location.href.split('#')[0].split('?')[0];
+  qs('#btnStart').onclick = authorize;
+  qs('#btnMedList').onclick = ()=> run(activeMeds);
+  qs('#btnSummary').onclick = ()=> run(summary);
+  qs('#btnRefill').onclick = ()=> run(refillTask);
+  qs('#btnFindMrn').onclick = ()=> run(findByMrn);
+  maybeHandleRedirect();
+});
+
+async function run(fn){
+  qs('#err').textContent = '';
+  try{ await fn(); }
+  catch(e){ err(e.toString()); }
+}
+</script>
+</body>
+</html>
